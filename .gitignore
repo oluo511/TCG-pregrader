@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment files — never commit real secrets
+.env
+!.env.example
+
+# Model artifacts — too large for git
+artifacts/
+*.pkl
+*.h5
+*.pb
+saved_model/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.hypothesis/
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
