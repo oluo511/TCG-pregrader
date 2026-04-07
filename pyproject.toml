@@ -17,6 +17,10 @@ dependencies = [
     "opencv-python>=4.9.0",
     "pillow>=10.3.0",
     "structlog>=24.2.0",
+    # --- Training data pipeline ---
+    "httpx>=0.27.0",
+    "beautifulsoup4>=4.12.0",
+    "numpy>=1.26.0",
 ]
 
 [project.optional-dependencies]
@@ -33,6 +37,8 @@ dev = [
 [project.scripts]
 # CLI entry point — `pregrader predict ...` resolves to cli.app
 pregrader = "pregrader.cli:app"
+# Training data pipeline — `data-pipeline run ...` resolves to data_pipeline.cli:app
+data-pipeline = "data_pipeline.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["src"]
