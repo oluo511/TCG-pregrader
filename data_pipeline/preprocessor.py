@@ -17,13 +17,14 @@ All array dimension comments use this ordering.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
 import structlog
 from PIL import Image
 
+from data_pipeline._image_utils import detect_angle, letterbox_resize
 from data_pipeline.config import PipelineSettings
 from data_pipeline.exceptions import InvalidImageError
 from pregrader.services.preprocessing import PreprocessingService
@@ -187,7 +188,7 @@ class ImagePreprocessor:
         # If angle > threshold, attempt perspective correction via the
         # existing PreprocessingService before re-checking.
         # ----------------------------------------------------------------
-        angle = self._detect_angle(bgr)  # degrees in [0, 90]
+        angle = detect_angle(bgr)  # degrees in [0, 90]
 
         if angle > s.max_skew_angle:
             # Attempt correction: BGR → RGB PIL → _apply_perspective_correction
@@ -201,7 +202,7 @@ class ImagePreprocessor:
             )  # shape: (H, W, 3)
 
             # Re-detect angle on the corrected image.
-            angle_after = self._detect_angle(corrected_bgr)
+            angle_after = detect_angle(corrected_bgr)
 
             if angle_after > s.max_skew_angle:
                 # Correction did not bring angle within threshold — reject.
@@ -281,61 +282,11 @@ class ImagePreprocessor:
             rows_removed=rows_to_remove,
         )
 
-        # ----------------------------------------------------------------
-        # Letterbox-resize to target_size (Req 11.3)
-        # Scale uniformly so the card fills as much of the target as possible
-        # without distortion, then pad the remainder with black pixels.
-        # ----------------------------------------------------------------
+        # Letterbox-resize to target_size — delegates to _image_utils (Req 11.3).
         target_height, target_width = target_size
-
-        # Uniform scale factor — use the smaller axis to avoid overflow.
-        scale = min(target_width / W, target_height / cropped_H)
-        new_w = int(W * scale)
-        new_h = int(cropped_H * scale)
-
-        # Resize with INTER_LINEAR (good quality/speed trade-off for downscaling).
-        resized = cv2.resize(cropped, (new_w, new_h))  # shape: (new_h, new_w, C)
-
-        # Allocate black canvas at exact target dimensions (H, W, C).
-        canvas = np.zeros((target_height, target_width, C), dtype=image.dtype)
-
-        # Center the resized image on the canvas.
-        pad_top = (target_height - new_h) // 2
-        pad_left = (target_width - new_w) // 2
-        canvas[pad_top : pad_top + new_h, pad_left : pad_left + new_w, :] = resized
-
-        return canvas  # shape: (target_height, target_width, C)
+        return letterbox_resize(cropped, target_height, target_width)
 
     @property
     def rejection_counts(self) -> dict[str, int]:
         """Return a copy of per-filter rejection tallies for GradeReporter."""
         return dict(self._rejection_counts)
-
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
-
-    def _detect_angle(self, bgr: np.ndarray) -> float:
-        """Detect slab skew angle using largest contour minAreaRect.
-
-        Returns angle in [0, 90] degrees.
-
-        Why minAreaRect? It returns the minimum-area bounding rectangle of a
-        contour, which gives us the rotation angle of the dominant shape in
-        the image — the card slab boundary.
-
-        cv2.minAreaRect returns angle in [-90, 0); we normalize to [0, 90]
-        by taking the absolute value.
-        """
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)  # shape: (H, W)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)  # shape: (H, W)
-        edges = cv2.Canny(blurred, 50, 150)  # shape: (H, W) — binary edge map
-        contours, _ = cv2.findContours(
-            edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        if not contours:
-            return 0.0
-        largest = max(contours, key=cv2.contourArea)
-        _, _, angle = cv2.minAreaRect(largest)
-        # cv2.minAreaRect returns angle in [-90, 0); normalize to [0, 90]
-        return abs(angle) if angle != 0 else 0.0
