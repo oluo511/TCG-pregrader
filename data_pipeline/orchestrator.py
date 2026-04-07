@@ -92,15 +92,11 @@ class Orchestrator:
         # Must happen before scrapers run so they skip already-seen certs.
         self._deduplicator.load()
 
-        # Step 2 — Run both scrapers concurrently.
-        # TaskGroup cancels the sibling task if either raises — prevents a
-        # hung scraper from blocking the pipeline indefinitely.
-        async with asyncio.TaskGroup() as tg:
-            ebay_task = tg.create_task(self._ebay.scrape(grades))
-            cardladder_task = tg.create_task(self._cardladder.scrape(grades))
-
-        ebay_records: list[ScrapedRecord] = ebay_task.result()
-        cardladder_records: list[ScrapedRecord] = cardladder_task.result()
+        # Step 2 — Run eBay scraper.
+        # Card Ladder returns 403 without a browser session cookie — it requires
+        # authentication that we don't have yet. Disabled until auth is implemented.
+        ebay_records: list[ScrapedRecord] = await self._ebay.scrape(grades)
+        cardladder_records: list[ScrapedRecord] = []
         all_records: list[ScrapedRecord] = ebay_records + cardladder_records
 
         logger.info(

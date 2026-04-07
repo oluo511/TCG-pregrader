@@ -55,9 +55,28 @@ _SEARCH_URL = (
     "&_pgn={page}"
 )
 
-# Realistic User-Agent to avoid trivial bot-detection blocks.
-# We identify ourselves as TCG-pipeline so eBay can contact us if needed.
-_USER_AGENT = "Mozilla/5.0 (compatible; TCG-pipeline/1.0)"
+# Realistic browser User-Agent — eBay's bot detection checks this header.
+# The "compatible; TCG-pipeline/1.0" string was too obviously a bot.
+# Using a real Chrome UA significantly reduces 503 rejection rates.
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+# Additional headers that real browsers send — absence of these is a
+# common bot-detection signal.
+_HEADERS = {
+    "User-Agent": _USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+}
 
 
 class EbayScraper(BaseScraper):
@@ -87,7 +106,7 @@ class EbayScraper(BaseScraper):
 
         try:
             async with httpx.AsyncClient(
-                headers={"User-Agent": _USER_AGENT},
+                headers=_HEADERS,
                 follow_redirects=True,
                 timeout=30.0,
             ) as client:
