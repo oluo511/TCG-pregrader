@@ -38,3 +38,6 @@ logs/
 # IDE
 .vscode/
 .idea/
+
+# Kiro specs — local AI assistant context, not project source
+.kiro/
