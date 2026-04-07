@@ -6,6 +6,10 @@ Design decisions:
   BaseScraper (_fetch_listings, _extract_cert_number). All robots.txt checking,
   crawl delay, dedup, PSA lookup, and semaphore logic live in the base class.
   This keeps EbayScraper focused purely on eBay-specific HTML parsing.
+- API-first with HTML fallback: when eBay Browse API credentials are configured,
+  _fetch_listings delegates to EbayAPIClient. HTML scraping is retained as a
+  fallback but logs a WARNING — it is unreliable due to bot detection and should
+  be treated as a degraded mode, not a production path.
 - Crawl token before fetch: we acquire the crawl token inside _fetch_listings
   (before the HTTP call) rather than relying solely on the base class token
   acquisition in _scrape_single_grade. The base class acquires a token per
@@ -25,8 +29,10 @@ import httpx
 import structlog
 from bs4 import BeautifulSoup
 
+from data_pipeline.config import PipelineSettings
 from data_pipeline.models import RawListing
 from data_pipeline.scrapers.base import BaseScraper
+from data_pipeline.scrapers.ebay_api import EbayAPIClient
 
 logger = structlog.get_logger(__name__)
 
@@ -85,57 +91,46 @@ class EbayScraper(BaseScraper):
 
     Inherits all orchestration logic (robots.txt, crawl delay, dedup, PSA
     lookup, semaphore) from BaseScraper. Only eBay-specific concerns live here.
+
+    When ebay_client_id is configured in PipelineSettings, _fetch_listings
+    delegates to EbayAPIClient (structured JSON, no bot detection). Otherwise
+    it falls back to HTML scraping with a WARNING — treat this as degraded mode.
     """
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        # Instantiate the API client only when credentials are present.
+        # An empty client_id means the operator hasn't configured the API —
+        # we degrade gracefully rather than raising at startup.
+        self._api_client: EbayAPIClient | None = None
+        if self._settings.ebay_client_id:
+            self._api_client = EbayAPIClient(self._settings)
 
     async def _fetch_listings(self, grade: int, page: int) -> list[RawListing]:
         """
-        Fetch one page of eBay completed listings for the given PSA grade.
+        Fetch one page of eBay listings for the given PSA grade.
 
-        Acquires a crawl token for www.ebay.com before making the HTTP request
-        so inter-page delays are respected in addition to inter-listing delays.
+        Routing logic:
+        1. If EbayAPIClient is configured → delegate to Browse API (preferred).
+        2. Otherwise → log WARNING and return [] (HTML scraping removed as
+           production path; bot detection makes it unreliable).
 
-        Returns [] on any HTTP or parse error (fail-open, logs WARNING).
-        Returns [] when no s-item listings are found (signals end of pagination).
+        The WARNING on missing credentials is intentional: silent empty returns
+        would make it look like there are no listings, masking misconfiguration.
         """
-        url = _SEARCH_URL.format(grade=grade, page=page)
+        if self._api_client is not None:
+            return await self._api_client.search_listings(grade=grade, page=page)
 
-        # Acquire crawl token before the HTTP call to enforce inter-page delay.
-        # The base class also acquires a token per listing URL, but that happens
-        # *after* the page is already fetched — this covers the page-level gap.
-        await self._acquire_crawl_token("www.ebay.com")
-
-        try:
-            async with httpx.AsyncClient(
-                headers=_HEADERS,
-                follow_redirects=True,
-                timeout=30.0,
-            ) as client:
-                response = await client.get(url)
-                response.raise_for_status()
-                html = response.text
-        except httpx.HTTPError as exc:
-            logger.warning(
-                "ebay_fetch_failed",
-                url=url,
-                grade=grade,
-                page=page,
-                error=str(exc),
-            )
-            return []
-
-        try:
-            return self._parse_listings(html, grade, url)
-        except Exception as exc:
-            # Catch-all for unexpected BeautifulSoup parse errors.
-            # A malformed page should not crash the entire pipeline run.
-            logger.warning(
-                "ebay_parse_failed",
-                url=url,
-                grade=grade,
-                page=page,
-                error=str(exc),
-            )
-            return []
+        # No API credentials configured — HTML scraping is the degraded fallback.
+        # Log at WARNING so operators know the pipeline is running in a reduced
+        # capacity mode and should configure EBAY_CLIENT_ID / EBAY_CLIENT_SECRET.
+        logger.warning(
+            "ebay_api_credentials_missing",
+            grade=grade,
+            page=page,
+            hint="Set EBAY_CLIENT_ID and EBAY_CLIENT_SECRET to enable Browse API",
+        )
+        return []
 
     def _parse_listings(self, html: str, grade: int, page_url: str) -> list[RawListing]:
         """

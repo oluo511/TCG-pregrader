@@ -127,6 +127,20 @@ class PipelineSettings(BaseSettings):
     )
 
     # -------------------------------------------------------------------------
+    # eBay Browse API credentials (optional — falls back to HTML scraping)
+    # Using SecretStr on client_secret ensures it is never exposed in logs,
+    # repr, or model_dump() output, matching the same pattern as psa_api_token.
+    # -------------------------------------------------------------------------
+    ebay_client_id: str = Field(
+        default="",
+        description="eBay App ID (Client ID) for Browse API",
+    )
+    ebay_client_secret: SecretStr = Field(
+        default=SecretStr(""),
+        description="eBay Client Secret for Browse API",
+    )
+
+    # -------------------------------------------------------------------------
     # Output paths
     # -------------------------------------------------------------------------
     output_dir: Path = Field(

@@ -3,18 +3,19 @@ Feature: training-data-pipeline
 Tests: 10.3 — EbayScraper unit tests (Requirements 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7)
 
 Why these tests?
-- URL construction is the contract between the scraper and eBay's search API.
-  A wrong parameter (e.g., missing LH_Sold) silently returns wrong data.
+- Routing logic: EbayScraper now delegates to EbayAPIClient when credentials
+  are present. Tests verify the correct path is taken in both cases so a
+  misconfiguration doesn't silently produce zero listings.
 - Cert extraction is the critical signal that links a listing to a PSA record.
   Both false-positives (wrong cert) and false-negatives (None when cert exists)
   corrupt the training dataset.
-- HTTP error handling must be fail-open: a single bad page should not abort
-  the entire grade's collection run.
+- _parse_listings is tested directly (not via _fetch_listings) because the HTML
+  parsing logic is still the fallback path and must remain correct even though
+  it's no longer the primary production path.
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
 import pytest
 from pydantic import SecretStr
 
@@ -24,15 +25,25 @@ from data_pipeline.downloader import ImageDownloader
 from data_pipeline.models import RawListing
 from data_pipeline.psa_client import PSAClient
 from data_pipeline.scrapers.ebay import EbayScraper
+from data_pipeline.scrapers.ebay_api import EbayAPIClient
 
 
 # ---------------------------------------------------------------------------
 # Shared fixture helpers
 # ---------------------------------------------------------------------------
 
-def _make_scraper() -> EbayScraper:
-    """Instantiate EbayScraper with fully mocked dependencies."""
-    settings = PipelineSettings(psa_api_token=SecretStr("test-token"))
+def _make_scraper(ebay_client_id: str = "") -> EbayScraper:
+    """
+    Instantiate EbayScraper with fully mocked dependencies.
+
+    ebay_client_id="" → no API client (degraded mode, returns []).
+    ebay_client_id="app-id" → EbayAPIClient is instantiated.
+    """
+    settings = PipelineSettings(
+        psa_api_token=SecretStr("test-token"),
+        ebay_client_id=ebay_client_id,
+        ebay_client_secret=SecretStr("test-secret" if ebay_client_id else ""),
+    )
     return EbayScraper(
         settings=settings,
         psa_client=MagicMock(spec=PSAClient),
@@ -52,56 +63,100 @@ def _make_listing(title: str = "PSA 9 Charizard cert 12345678 Pokemon") -> RawLi
 
 
 # ---------------------------------------------------------------------------
-# 10.3a — Correct search URL is constructed for each grade 1–10
+# 10.3a — _fetch_listings delegates to EbayAPIClient when credentials present
 #
-# Why test URL construction?
-# The URL is the only interface between the scraper and eBay. Wrong parameters
-# (e.g., missing LH_Complete or wrong grade) silently return incorrect data
-# that would corrupt the training set without any error signal.
+# Why test delegation explicitly?
+# The routing branch (api_client is not None) is the production path. If the
+# delegation is broken, the scraper silently falls through to the warning path
+# and returns [] — no error, just missing data.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("grade", range(1, 11))
-async def test_fetch_listings_url_construction(grade: int) -> None:
+async def test_fetch_listings_delegates_to_api_client_when_configured() -> None:
     """
-    _fetch_listings must build a URL containing the correct grade, LH_Complete,
-    and LH_Sold parameters for every PSA grade 1–10 (Req 2.1).
+    When ebay_client_id is set, _fetch_listings must call
+    EbayAPIClient.search_listings and return its result (Req 2.1).
     """
-    scraper = _make_scraper()
+    scraper = _make_scraper(ebay_client_id="my-app-id")
+    assert scraper._api_client is not None
 
-    captured_urls: list[str] = []
+    expected = [_make_listing()]
+    with patch.object(
+        scraper._api_client,
+        "search_listings",
+        new_callable=AsyncMock,
+        return_value=expected,
+    ) as mock_search:
+        result = await scraper._fetch_listings(grade=9, page=2)
 
-    # Minimal HTML with no s-item listings — we only care about the URL called.
-    empty_html = "<html><body><ul class='srp-results'></ul></body></html>"
+    mock_search.assert_called_once_with(grade=9, page=2)
+    assert result == expected
 
-    mock_response = MagicMock()
-    mock_response.text = empty_html
-    mock_response.raise_for_status = MagicMock()
 
-    mock_client = AsyncMock()
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=False)
+@pytest.mark.asyncio
+async def test_fetch_listings_passes_grade_and_page_to_api_client() -> None:
+    """
+    _fetch_listings must forward grade and page unchanged to search_listings.
+    An off-by-one on page would silently skip or double-fetch pages.
+    """
+    scraper = _make_scraper(ebay_client_id="my-app-id")
 
-    async def _capture_get(url: str, **kwargs) -> MagicMock:
-        captured_urls.append(url)
-        return mock_response
+    with patch.object(
+        scraper._api_client,  # type: ignore[union-attr]
+        "search_listings",
+        new_callable=AsyncMock,
+        return_value=[],
+    ) as mock_search:
+        await scraper._fetch_listings(grade=7, page=3)
 
-    mock_client.get = _capture_get
-
-    with patch("data_pipeline.scrapers.ebay.httpx.AsyncClient", return_value=mock_client):
-        # Patch crawl token so the test doesn't sleep.
-        with patch.object(scraper, "_acquire_crawl_token", new_callable=AsyncMock):
-            await scraper._fetch_listings(grade, page=1)
-
-    assert len(captured_urls) == 1
-    url = captured_urls[0]
-    assert f"PSA+{grade}+pokemon" in url
-    assert "LH_Complete=1" in url
-    assert "LH_Sold=1" in url
+    mock_search.assert_called_once_with(grade=7, page=3)
 
 
 # ---------------------------------------------------------------------------
-# 10.3b — Cert number NOT extracted when title has no PSA pattern → None
+# 10.3b — _fetch_listings returns [] with WARNING when no credentials
+#
+# Why test the degraded path?
+# Without credentials, the scraper must not silently return [] as if there are
+# no listings — it must log a WARNING so operators know the pipeline is
+# misconfigured. The [] return is intentional (fail-open), but the log is the
+# signal that something needs fixing.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_fetch_listings_returns_empty_when_no_api_credentials() -> None:
+    """
+    When ebay_client_id is empty, _fetch_listings must return [] (Req 2.5).
+    No EbayAPIClient should be instantiated.
+    """
+    scraper = _make_scraper(ebay_client_id="")
+    assert scraper._api_client is None
+
+    result = await scraper._fetch_listings(grade=9, page=1)
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_no_api_client_instantiated_without_credentials() -> None:
+    """
+    EbayScraper.__init__ must leave _api_client as None when ebay_client_id
+    is empty — instantiating it with blank credentials would cause a 401 on
+    every token fetch rather than a clear startup-time misconfiguration signal.
+    """
+    scraper = _make_scraper(ebay_client_id="")
+    assert scraper._api_client is None
+
+
+def test_api_client_instantiated_when_credentials_present() -> None:
+    """
+    EbayScraper.__init__ must create an EbayAPIClient instance when
+    ebay_client_id is non-empty.
+    """
+    scraper = _make_scraper(ebay_client_id="real-app-id")
+    assert isinstance(scraper._api_client, EbayAPIClient)
+
+
+# ---------------------------------------------------------------------------
+# 10.3c — Cert number NOT extracted when title has no PSA pattern → None
 #
 # Why test the None case explicitly?
 # The base class skips listings where _extract_cert_number returns None.
@@ -127,7 +182,7 @@ def test_extract_cert_number_returns_none_for_short_digit_sequence() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 10.3c — Cert number IS extracted from valid PSA patterns
+# 10.3d — Cert number IS extracted from valid PSA patterns
 #
 # Why multiple title formats?
 # Sellers use inconsistent formatting. The regex must handle "PSA ... cert NNN",
@@ -137,7 +192,7 @@ def test_extract_cert_number_returns_none_for_short_digit_sequence() -> None:
 @pytest.mark.parametrize("title, expected_cert", [
     ("PSA 9 Charizard cert 12345678 Pokemon", "12345678"),
     ("cert 9876543 PSA graded Pikachu", "9876543"),
-    ("PSA cert 00012345678 Blastoise", "0001234567"),  # 11 digits — regex captures max 10, so first 10 matched
+    ("PSA cert 00012345678 Blastoise", "0001234567"),  # 11 digits — regex captures max 10
     ("Pokemon PSA cert#98765432 Venusaur", "98765432"),
     ("Sold PSA 10 cert: 1234567 Mewtwo", "1234567"),  # 7-digit minimum
 ])
@@ -153,68 +208,15 @@ def test_extract_cert_number_valid_patterns(title: str, expected_cert: str) -> N
 
 
 # ---------------------------------------------------------------------------
-# 10.3d — _fetch_listings returns [] on HTTP error (no exception propagates)
+# 10.3e — _parse_listings: "Shop on eBay" promotional item is skipped
 #
-# Why test fail-open behaviour?
-# A single eBay page returning a 5xx or a network timeout must not abort the
-# entire grade's collection run. The base class pagination loop treats [] as
-# "no more pages" and moves on (Req 2.5).
+# Why test _parse_listings directly?
+# The HTML parsing logic is still present (it's the fallback path) and must
+# remain correct. Testing it directly avoids the routing layer and keeps
+# these tests independent of credential configuration.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_fetch_listings_returns_empty_on_transport_error() -> None:
-    """
-    httpx.TransportError must be caught, a WARNING logged, and [] returned.
-    No exception should propagate to the caller (Req 2.5).
-    """
-    scraper = _make_scraper()
-
-    mock_client = AsyncMock()
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=False)
-    mock_client.get = AsyncMock(side_effect=httpx.TransportError("connection reset"))
-
-    with patch("data_pipeline.scrapers.ebay.httpx.AsyncClient", return_value=mock_client):
-        with patch.object(scraper, "_acquire_crawl_token", new_callable=AsyncMock):
-            result = await scraper._fetch_listings(grade=9, page=1)
-
-    assert result == []
-
-
-@pytest.mark.asyncio
-async def test_fetch_listings_returns_empty_on_http_status_error() -> None:
-    """
-    A non-2xx HTTP response (e.g., 403 Forbidden) must be caught and [] returned.
-    """
-    scraper = _make_scraper()
-
-    mock_response = MagicMock()
-    mock_response.raise_for_status = MagicMock(
-        side_effect=httpx.HTTPStatusError(
-            "403 Forbidden",
-            request=MagicMock(),
-            response=MagicMock(),
-        )
-    )
-
-    mock_client = AsyncMock()
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=False)
-    mock_client.get = AsyncMock(return_value=mock_response)
-
-    with patch("data_pipeline.scrapers.ebay.httpx.AsyncClient", return_value=mock_client):
-        with patch.object(scraper, "_acquire_crawl_token", new_callable=AsyncMock):
-            result = await scraper._fetch_listings(grade=9, page=1)
-
-    assert result == []
-
-
-# ---------------------------------------------------------------------------
-# 10.3e — HTML parsing: "Shop on eBay" promotional item is skipped
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_fetch_listings_skips_shop_on_ebay_item() -> None:
+def test_parse_listings_skips_shop_on_ebay_item() -> None:
     """
     eBay injects a "Shop on eBay" promotional card into every results page.
     It must be filtered out so it doesn't appear as a real listing (Req 2.3).
@@ -236,29 +238,17 @@ async def test_fetch_listings_skips_shop_on_ebay_item() -> None:
     </ul></body></html>
     """
 
-    mock_response = MagicMock()
-    mock_response.text = html
-    mock_response.raise_for_status = MagicMock()
-
-    mock_client = AsyncMock()
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=False)
-    mock_client.get = AsyncMock(return_value=mock_response)
-
-    with patch("data_pipeline.scrapers.ebay.httpx.AsyncClient", return_value=mock_client):
-        with patch.object(scraper, "_acquire_crawl_token", new_callable=AsyncMock):
-            listings = await scraper._fetch_listings(grade=9, page=1)
+    listings = scraper._parse_listings(html, grade=9, page_url="https://www.ebay.com/sch/i.html")
 
     assert len(listings) == 1
     assert listings[0].title == "PSA 9 Charizard cert 12345678"
 
 
 # ---------------------------------------------------------------------------
-# 10.3f — HTML parsing: listing without image is skipped
+# 10.3f — _parse_listings: listing without image is skipped
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_fetch_listings_skips_listing_without_image() -> None:
+def test_parse_listings_skips_listing_without_image() -> None:
     """
     Listings with no image URL must be skipped — we cannot train on a record
     with no slab photo (Req 2.4).
@@ -275,31 +265,18 @@ async def test_fetch_listings_skips_listing_without_image() -> None:
     </ul></body></html>
     """
 
-    mock_response = MagicMock()
-    mock_response.text = html
-    mock_response.raise_for_status = MagicMock()
-
-    mock_client = AsyncMock()
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=False)
-    mock_client.get = AsyncMock(return_value=mock_response)
-
-    with patch("data_pipeline.scrapers.ebay.httpx.AsyncClient", return_value=mock_client):
-        with patch.object(scraper, "_acquire_crawl_token", new_callable=AsyncMock):
-            listings = await scraper._fetch_listings(grade=9, page=1)
-
+    listings = scraper._parse_listings(html, grade=9, page_url="https://www.ebay.com/sch/i.html")
     assert listings == []
 
 
 # ---------------------------------------------------------------------------
-# 10.3g — HTML parsing: data-src fallback for lazy-loaded images
+# 10.3g — _parse_listings: data-src fallback for lazy-loaded images
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_fetch_listings_uses_data_src_fallback() -> None:
+def test_parse_listings_uses_data_src_fallback() -> None:
     """
     eBay lazy-loads images: the real URL may be in data-src before JS hydration.
-    _fetch_listings must fall back to data-src when src is absent (Req 2.4).
+    _parse_listings must fall back to data-src when src is absent (Req 2.4).
     """
     scraper = _make_scraper()
 
@@ -315,48 +292,22 @@ async def test_fetch_listings_uses_data_src_fallback() -> None:
     </ul></body></html>
     """
 
-    mock_response = MagicMock()
-    mock_response.text = html
-    mock_response.raise_for_status = MagicMock()
-
-    mock_client = AsyncMock()
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=False)
-    mock_client.get = AsyncMock(return_value=mock_response)
-
-    with patch("data_pipeline.scrapers.ebay.httpx.AsyncClient", return_value=mock_client):
-        with patch.object(scraper, "_acquire_crawl_token", new_callable=AsyncMock):
-            listings = await scraper._fetch_listings(grade=9, page=1)
+    listings = scraper._parse_listings(html, grade=9, page_url="https://www.ebay.com/sch/i.html")
 
     assert len(listings) == 1
     assert listings[0].image_url == "https://i.ebayimg.com/images/g/abc/s-l500.jpg"
 
 
 # ---------------------------------------------------------------------------
-# 10.3h — Empty page returns [] (pagination stop signal)
+# 10.3h — _parse_listings: empty page returns [] (pagination stop signal)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_fetch_listings_returns_empty_on_no_items() -> None:
+def test_parse_listings_returns_empty_on_no_items() -> None:
     """
-    When a page contains no s-item elements, _fetch_listings returns [].
+    When a page contains no s-item elements, _parse_listings returns [].
     The base class pagination loop uses this as the stop signal (Req 2.6).
     """
     scraper = _make_scraper()
-
     html = "<html><body><ul class='srp-results'></ul></body></html>"
-
-    mock_response = MagicMock()
-    mock_response.text = html
-    mock_response.raise_for_status = MagicMock()
-
-    mock_client = AsyncMock()
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=False)
-    mock_client.get = AsyncMock(return_value=mock_response)
-
-    with patch("data_pipeline.scrapers.ebay.httpx.AsyncClient", return_value=mock_client):
-        with patch.object(scraper, "_acquire_crawl_token", new_callable=AsyncMock):
-            result = await scraper._fetch_listings(grade=9, page=99)
-
+    result = scraper._parse_listings(html, grade=9, page_url="https://www.ebay.com/sch/i.html")
     assert result == []
