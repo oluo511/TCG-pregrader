@@ -230,6 +230,15 @@ class PSAClient:
                 raise CertLookupError(cert_number, status)
 
             if 500 <= status < 600:
+                # PSA API docs: 500 usually means invalid credentials — don't
+                # retry, raise immediately so the operator knows to check the token.
+                # Other 5xx (502, 503) may be transient; retry those.
+                if status == 500:
+                    logger.error(
+                        "psa_500_likely_bad_credentials",
+                        cert_number=cert_number,
+                    )
+                    raise CertLookupError(cert_number, status)
                 if attempt < max_retries:
                     delay = base_delay * (2**attempt)
                     logger.warning(
@@ -280,16 +289,45 @@ class PSAClient:
         """
         try:
             payload = response.json()
-            cert_data = payload["PSAcert"]
+
+            # PSA API returns IsValidRequest=false for bad cert numbers or
+            # invalid format — treat as a non-retryable lookup failure.
+            if not payload.get("IsValidRequest", True):
+                server_msg = payload.get("ServerMessage", "unknown")
+                logger.warning(
+                    "psa_invalid_request",
+                    cert_number=cert_number,
+                    server_message=server_msg,
+                )
+                raise CertLookupError(cert_number, response.status_code)
+
+            # "No data found" means the cert number is valid format but not
+            # in the PSA database — treat as a lookup failure, not an error.
+            server_msg = payload.get("ServerMessage", "")
+            if "No data found" in server_msg:
+                logger.warning(
+                    "psa_cert_not_found",
+                    cert_number=cert_number,
+                )
+                raise CertLookupError(cert_number, response.status_code)
+
+            # PSA API uses "PSACert" (capital C) in the actual response.
+            # Fall back to "PSAcert" for any older API versions.
+            cert_data = payload.get("PSACert") or payload.get("PSAcert")
+            if cert_data is None:
+                raise KeyError("PSACert key not found in response")
+
             return CertRecord(
                 cert_number=cert_data["CertNumber"],
                 overall_grade=int(cert_data["OverallGrade"]),
-                centering=float(cert_data["Centering"]),
-                corners=float(cert_data["Corners"]),
-                edges=float(cert_data["Edges"]),
-                surface=float(cert_data["Surface"]),
+                centering=float(cert_data.get("Centering", 1.0)),
+                corners=float(cert_data.get("Corners", 1.0)),
+                edges=float(cert_data.get("Edges", 1.0)),
+                surface=float(cert_data.get("Surface", 1.0)),
                 verified=True,
             )
+        except CertLookupError:
+            raise
         except (KeyError, ValueError, TypeError) as exc:
             logger.error(
                 "psa_response_parse_error",
