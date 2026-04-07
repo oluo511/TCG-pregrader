@@ -41,7 +41,8 @@ pregrader = "pregrader.cli:app"
 data-pipeline = "data_pipeline.cli:app"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = [".", "src"]
+include = ["data_pipeline*", "pregrader*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
