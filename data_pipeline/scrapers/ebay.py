@@ -180,6 +180,12 @@ class EbayScraper(BaseScraper):
             if not image_url or not image_url.startswith("http"):
                 continue
 
+            # Upgrade thumbnail to full-size: s-l140 -> s-l500
+            # eBay CDN serves multiple sizes via the same path pattern.
+            # s-l140 is the grid thumbnail; s-l500 gives a usable resolution
+            # for slab feature detection without hitting bandwidth limits.
+            image_url = image_url.replace("s-l140", "s-l500").replace("s-l225", "s-l500")
+
             # Listing URL — first anchor pointing to an eBay item page
             link_el = card.select_one('a[href*="ebay.com/itm"]') or card.select_one("a.s-card__link")
             listing_url: str = link_el["href"] if link_el else page_url
