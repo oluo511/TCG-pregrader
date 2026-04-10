@@ -95,7 +95,10 @@ class Orchestrator:
         # Step 2 — Run eBay scraper.
         # Card Ladder returns 403 without a browser session cookie — it requires
         # authentication that we don't have yet. Disabled until auth is implemented.
-        ebay_records: list[ScrapedRecord] = await self._ebay.scrape(grades)
+        try:
+            ebay_records: list[ScrapedRecord] = await self._ebay.scrape(grades, max_per_grade=max_per_grade)
+        finally:
+            await self._ebay.close()
         cardladder_records: list[ScrapedRecord] = []
         all_records: list[ScrapedRecord] = ebay_records + cardladder_records
 

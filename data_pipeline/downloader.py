@@ -129,17 +129,21 @@ class ImageDownloader:
         """
         Inspect magic bytes to determine image format.
 
-        JPEG prefix is 3 bytes (FF D8 FF); PNG prefix is 4 bytes (89 50 4E 47).
-        We check the longer PNG prefix first to avoid false positives, then JPEG.
+        JPEG: FF D8 FF (3 bytes)
+        PNG:  89 50 4E 47 (4 bytes)
+        WebP: RIFF????WEBP — bytes 0-3 are 52 49 46 46, bytes 8-11 are 57 45 42 50.
+              eBay CDN serves .webp thumbnails; we accept and save them as-is.
 
         Raises:
             InvalidImageError: when the content does not match any known format.
         """
-        for magic, ext in self.VALID_MAGIC.items():
-            if content[: len(magic)] == magic:
-                return ext
+        if content[:3] == b"\xff\xd8\xff":
+            return "jpg"
+        if content[:4] == b"\x89\x50\x4e\x47":
+            return "png"
+        if content[:4] == b"\x52\x49\x46\x46" and content[8:12] == b"\x57\x45\x42\x50":
+            return "webp"
 
-        # Neither JPEG nor PNG — log and raise before touching disk
         logger.warning(
             "invalid_image_magic_bytes",
             cert_number=cert_number,

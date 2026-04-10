@@ -69,36 +69,34 @@ class BaseScraper(ABC):
         # Used by _acquire_crawl_token to enforce source-specific crawl delays.
         self._last_request_time: dict[str, float] = {}
 
-    async def scrape(self, grades: list[int]) -> list[ScrapedRecord]:
+    async def scrape(self, grades: list[int], max_per_grade: int | None = None) -> list[ScrapedRecord]:
         """
         Fan out across grades concurrently (bounded by semaphore), paginate
-        each grade until max_listings_per_grade is reached or the source is
-        exhausted, and return a flat list of ScrapedRecords.
+        each grade until max_per_grade is reached or the source is exhausted,
+        and return a flat list of ScrapedRecords.
 
-        robots.txt is checked before each page fetch; pages that are disallowed
-        are skipped with a WARNING rather than raising an error.
+        Args:
+            grades: PSA grade integers to collect.
+            max_per_grade: Per-grade cap. Defaults to settings.max_listings_per_grade.
         """
+        limit = max_per_grade if max_per_grade is not None else self._settings.max_listings_per_grade
 
         async def _scrape_grade(grade: int) -> list[ScrapedRecord]:
             async with self._semaphore:
-                return await self._scrape_single_grade(grade)
+                return await self._scrape_single_grade(grade, limit)
 
-        # asyncio.gather runs all grade tasks concurrently; the semaphore
-        # ensures at most max_concurrent_requests are active at once.
         results: list[list[ScrapedRecord]] = await asyncio.gather(
             *[_scrape_grade(g) for g in grades]
         )
-        # Flatten the per-grade lists into a single result list.
         return [record for grade_records in results for record in grade_records]
 
-    async def _scrape_single_grade(self, grade: int) -> list[ScrapedRecord]:
+    async def _scrape_single_grade(self, grade: int, max_listings: int) -> list[ScrapedRecord]:
         """
         Paginate through listings for a single grade, respecting robots.txt and
-        crawl delay, until max_listings_per_grade is reached or no more pages.
+        crawl delay, until max_listings is reached or no more pages.
         """
         records: list[ScrapedRecord] = []
         page = 1
-        max_listings = self._settings.max_listings_per_grade
 
         while len(records) < max_listings:
             # Build a representative URL for this page to check robots.txt.
@@ -130,10 +128,28 @@ class BaseScraper(ABC):
 
                 cert_number = self._extract_cert_number(listing)
                 if cert_number is None:
-                    logger.debug(
-                        "no_cert_number_extracted",
-                        listing_url=listing.listing_url,
-                        grade=grade,
+                    # No cert in title — use the search grade as the label directly.
+                    # This is the common case for eBay listings; most sellers don't
+                    # include the PSA cert number in the title. We trust the grade
+                    # from the search query (LH_Complete + LH_Sold filters mean the
+                    # listing was a real completed sale at that grade).
+                    from data_pipeline.models import CertRecord
+                    cert_record = CertRecord(
+                        cert_number=f"ebay_{listing.listing_url.split('/')[-1].split('?')[0]}",
+                        overall_grade=listing.raw_grade,
+                        centering=1.0,
+                        corners=1.0,
+                        edges=1.0,
+                        surface=1.0,
+                        verified=False,
+                    )
+                    self._deduplicator.mark_seen(cert_record.cert_number, listing.source)
+                    records.append(
+                        ScrapedRecord(
+                            cert_record=cert_record,
+                            image_url=listing.image_url,
+                            source=listing.source,
+                        )
                     )
                     continue
 

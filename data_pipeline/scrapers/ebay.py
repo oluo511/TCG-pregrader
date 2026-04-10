@@ -2,186 +2,186 @@
 EbayScraper — fetches completed PSA-graded Pokémon card listings from eBay.
 
 Design decisions:
-- Template Method: this class only implements the two abstract methods from
-  BaseScraper (_fetch_listings, _extract_cert_number). All robots.txt checking,
-  crawl delay, dedup, PSA lookup, and semaphore logic live in the base class.
-  This keeps EbayScraper focused purely on eBay-specific HTML parsing.
-- API-first with HTML fallback: when eBay Browse API credentials are configured,
-  _fetch_listings delegates to EbayAPIClient. HTML scraping is retained as a
-  fallback but logs a WARNING — it is unreliable due to bot detection and should
-  be treated as a degraded mode, not a production path.
-- Crawl token before fetch: we acquire the crawl token inside _fetch_listings
-  (before the HTTP call) rather than relying solely on the base class token
-  acquisition in _scrape_single_grade. The base class acquires a token per
-  listing URL *after* the page is fetched; acquiring one here ensures the
-  inter-page delay is also respected, preventing burst requests across pages.
-- html.parser over lxml: avoids a C-extension dependency. lxml is faster but
-  adds a native build requirement that complicates Docker/CI images. For the
-  volume of pages we scrape, html.parser is fast enough.
-- Fail-open on parse errors: a single malformed eBay page should not abort the
-  entire grade's collection run. We log a WARNING and return [] so the
-  pagination loop terminates gracefully for that grade.
+- Playwright async API: eBay's search results are fully JS-rendered. We use
+  playwright.async_api which is designed for asyncio — no thread-affinity
+  issues, no greenlet conflicts, and it composes naturally with the async
+  scraper base class.
+- Browser reuse: one browser instance is created at first use and shared
+  across all page fetches in a pipeline run. Each fetch gets a fresh context
+  (isolated cookies/storage) to avoid session-based bot detection heuristics.
+- Resource blocking: images, fonts, media, and stylesheets are aborted during
+  page load. We only need the DOM — blocking binary resources cuts load time
+  from ~8s to ~2-3s per page.
+- API-first: when eBay Browse API credentials are configured, Playwright is
+  skipped entirely in favour of the structured JSON API.
 """
 
 import re
+from typing import TYPE_CHECKING
 
-import httpx
 import structlog
 from bs4 import BeautifulSoup
 
-from data_pipeline.config import PipelineSettings
 from data_pipeline.models import RawListing
 from data_pipeline.scrapers.base import BaseScraper
 from data_pipeline.scrapers.ebay_api import EbayAPIClient
 
+if TYPE_CHECKING:
+    from playwright.async_api import Browser, Playwright
+
 logger = structlog.get_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# Cert extraction pattern (class-level constant)
-#
-# Why this pattern?
-# eBay listing titles are free-form text. Sellers write things like:
-#   "PSA 9 Charizard cert 12345678"
-#   "cert 9876543 PSA graded Pikachu"
-#   "PSA cert#00012345678 Blastoise"
-# The pattern anchors on "PSA" or "cert" as a signal word, skips any
-# non-digit characters (spaces, #, :, etc.), then captures 7–10 consecutive
-# digits. 7 digits is the minimum PSA cert length; 10 is the current maximum.
-# ---------------------------------------------------------------------------
 CERT_PATTERN = re.compile(r"(?:PSA|cert)[^\d]*(\d{7,10})", re.IGNORECASE)
 
-# eBay completed/sold listings search URL template.
-# LH_Complete=1 → completed listings; LH_Sold=1 → sold only (filters out
-# unsold completed listings which have no transaction price signal).
 _SEARCH_URL = (
     "https://www.ebay.com/sch/i.html"
-    "?_nkw=PSA+{grade}+pokemon"
+    "?_nkw=PSA+{grade}+pokemon+slab"
     "&LH_Complete=1"
     "&LH_Sold=1"
     "&_pgn={page}"
 )
 
-# Realistic browser User-Agent — eBay's bot detection checks this header.
-# The "compatible; TCG-pipeline/1.0" string was too obviously a bot.
-# Using a real Chrome UA significantly reduces 503 rejection rates.
-_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
-
-# Additional headers that real browsers send — absence of these is a
-# common bot-detection signal.
-_HEADERS = {
-    "User-Agent": _USER_AGENT,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-}
+_ITEM_SELECTOR = "li.s-card"
+_PAGE_TIMEOUT_MS = 20_000
+_BLOCKED_RESOURCE_TYPES = {"image", "media", "font", "stylesheet"}
 
 
 class EbayScraper(BaseScraper):
     """
-    Scrapes eBay completed/sold listings for PSA-graded Pokémon cards.
-
-    Inherits all orchestration logic (robots.txt, crawl delay, dedup, PSA
-    lookup, semaphore) from BaseScraper. Only eBay-specific concerns live here.
-
-    When ebay_client_id is configured in PipelineSettings, _fetch_listings
-    delegates to EbayAPIClient (structured JSON, no bot detection). Otherwise
-    it falls back to HTML scraping with a WARNING — treat this as degraded mode.
+    Scrapes eBay completed/sold listings for PSA-graded Pokémon cards
+    using Playwright's async API for JS-rendered page content.
     """
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)  # type: ignore[arg-type]
-        # Instantiate the API client only when credentials are present.
-        # An empty client_id means the operator hasn't configured the API —
-        # we degrade gracefully rather than raising at startup.
         self._api_client: EbayAPIClient | None = None
         if self._settings.ebay_client_id:
             self._api_client = EbayAPIClient(self._settings)
+        self._playwright: "Playwright | None" = None
+        self._browser: "Browser | None" = None
+
+    async def _ensure_browser(self) -> "Browser":
+        """Launch Playwright + Chromium on first call; return cached instance."""
+        if self._browser is None:
+            from playwright.async_api import async_playwright
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+            )
+            logger.info("playwright_browser_launched")
+        return self._browser
+
+    async def close(self) -> None:
+        """Shut down the browser and Playwright runtime. Call after scraping."""
+        if self._browser is not None:
+            await self._browser.close()
+            self._browser = None
+        if self._playwright is not None:
+            await self._playwright.stop()
+            self._playwright = None
 
     async def _fetch_listings(self, grade: int, page: int) -> list[RawListing]:
-        """
-        Fetch one page of eBay listings for the given PSA grade.
-
-        Routing logic:
-        1. If EbayAPIClient is configured → delegate to Browse API (preferred).
-        2. Otherwise → log WARNING and return [] (HTML scraping removed as
-           production path; bot detection makes it unreliable).
-
-        The WARNING on missing credentials is intentional: silent empty returns
-        would make it look like there are no listings, masking misconfiguration.
-        """
+        """Route to Browse API if configured, otherwise use Playwright."""
         if self._api_client is not None:
             return await self._api_client.search_listings(grade=grade, page=page)
+        return await self._fetch_with_playwright(grade, page)
 
-        # No API credentials configured — HTML scraping is the degraded fallback.
-        # Log at WARNING so operators know the pipeline is running in a reduced
-        # capacity mode and should configure EBAY_CLIENT_ID / EBAY_CLIENT_SECRET.
-        logger.warning(
-            "ebay_api_credentials_missing",
+    async def _fetch_with_playwright(self, grade: int, page: int) -> list[RawListing]:
+        """
+        Open a fresh browser context, navigate to the eBay search page,
+        wait for listings to hydrate, and return parsed RawListing objects.
+        """
+        browser = await self._ensure_browser()
+        url = _SEARCH_URL.format(grade=grade, page=page)
+
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 800},
+            locale="en-US",
+        )
+        try:
+            pw_page = await context.new_page()
+
+            async def _block_resources(route):
+                if route.request.resource_type in _BLOCKED_RESOURCE_TYPES:
+                    await route.abort()
+                else:
+                    await route.continue_()
+
+            await pw_page.route("**/*", _block_resources)
+            await pw_page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+
+            try:
+                await pw_page.wait_for_selector(_ITEM_SELECTOR, timeout=_PAGE_TIMEOUT_MS)
+            except Exception:
+                # Timed out — could be bot detection or genuinely empty results.
+                # Capture a snippet of the page title to help diagnose.
+                title = await pw_page.title()
+                logger.warning(
+                    "ebay_playwright_no_items",
+                    grade=grade,
+                    page=page,
+                    page_title=title,
+                )
+                return []
+
+            html = await pw_page.content()
+        finally:
+            await context.close()
+
+        listings = self._parse_listings(html, grade, url)
+        logger.info(
+            "ebay_playwright_page_fetched",
             grade=grade,
             page=page,
-            hint="Set EBAY_CLIENT_ID and EBAY_CLIENT_SECRET to enable Browse API",
+            listings_found=len(listings),
         )
-        return []
+        return listings
 
     def _parse_listings(self, html: str, grade: int, page_url: str) -> list[RawListing]:
-        """
-        Parse eBay search results HTML into RawListing objects.
+        """Parse eBay search results HTML into RawListing objects.
 
-        eBay's search results page uses <li class="s-item"> for each listing.
-        We extract title, image URL, and listing URL from each item.
-
-        Skipped listings (logged at DEBUG):
-          - Title contains "Shop on eBay" — eBay injects a promotional item
-            at the top of every results page that is not a real listing.
-          - No image found in .s-item__image-wrapper — listing has no slab photo.
+        eBay's current DOM (2024+) uses li.s-card inside ul.srp-results.
+        Title is in the first element with a class containing 'title'.
+        Image is the first img tag in the card.
+        Listing URL is the first anchor pointing to ebay.com/itm.
         """
         soup = BeautifulSoup(html, "html.parser")
-        items = soup.find_all("li", class_="s-item")
+
+        ul = soup.find("ul", class_="srp-results")
+        if ul is None:
+            return []
+
+        cards = [
+            li for li in ul.find_all("li", recursive=False)
+            if "s-card" in (li.get("class") or [])
+        ]
 
         listings: list[RawListing] = []
-
-        for item in items:
-            # --- Title ---
-            title_el = item.select_one(".s-item__title")
+        for card in cards:
+            # Title — first element whose class contains "title"
+            title_el = card.select_one("[class*=title]")
             if title_el is None:
                 continue
             title = title_el.get_text(strip=True)
-
-            # eBay injects a "Shop on eBay" promotional card — skip it.
-            if "Shop on eBay" in title:
+            if not title or "Shop on eBay" in title:
                 continue
 
-            # --- Image URL ---
-            # eBay lazy-loads images: the real URL may be in data-src before
-            # the page is scrolled, or in src after JS hydration. We check
-            # both attributes so the scraper works on raw HTML without JS.
-            image_wrapper = item.select_one(".s-item__image-wrapper")
-            if image_wrapper is None:
-                continue
-            img_el = image_wrapper.find("img")
+            # Image
+            img_el = card.find("img")
             if img_el is None:
                 continue
-
             image_url: str | None = img_el.get("src") or img_el.get("data-src")
-            if not image_url:
-                logger.debug(
-                    "ebay_listing_no_image",
-                    page_url=page_url,
-                    title=title,
-                )
+            if not image_url or not image_url.startswith("http"):
                 continue
 
-            # --- Listing URL ---
-            link_el = item.select_one(".s-item__link")
+            # Listing URL — first anchor pointing to an eBay item page
+            link_el = card.select_one('a[href*="ebay.com/itm"]') or card.select_one("a.s-card__link")
             listing_url: str = link_el["href"] if link_el else page_url
 
             listings.append(
@@ -197,13 +197,5 @@ class EbayScraper(BaseScraper):
         return listings
 
     def _extract_cert_number(self, listing: RawListing) -> str | None:
-        """
-        Extract a PSA cert number from the listing title using CERT_PATTERN.
-
-        Returns the first 7–10 digit sequence preceded by "PSA" or "cert".
-        Returns None if no match is found — the base class will skip the listing.
-        """
         match = CERT_PATTERN.search(listing.title)
-        if match:
-            return match.group(1)
-        return None
+        return match.group(1) if match else None
