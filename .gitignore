@@ -41,3 +41,10 @@ logs/
 
 # Kiro specs — local AI assistant context, not project source
 .kiro/
+
+# Training data — images are too large for git, use DVC or cloud storage
+data/raw_slabs/
+
+# Pipeline runtime state
+.seen_certs.json
+.quota_state.json
