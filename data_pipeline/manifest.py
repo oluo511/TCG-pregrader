@@ -80,7 +80,14 @@ class ManifestBuilder:
              append data rows only (header must appear exactly once).
         """
         # --- Step 1: Make image path relative to project root ---
-        relative_path = str(image_path.relative_to(self._project_root))
+        try:
+            relative_path = str(image_path.relative_to(self._project_root))
+        except ValueError:
+            # image_path is not under project_root — use absolute path as fallback.
+            # This can happen when output_dir is configured as an absolute path
+            # outside the workspace (e.g. /tmp/slabs). The manifest will still
+            # work on this machine; portability is reduced.
+            relative_path = str(image_path)
 
         # --- Step 2: Validate the row before touching disk ---
         try:

@@ -165,23 +165,23 @@ class GradeReporter:
           terminal output. Structured log events go to stderr or a log sink in
           production; stdout is reserved for operator-facing summaries.
         """
-        print("\n── Grade Distribution ──────────────────────")
+        print("\n-- Grade Distribution ------------------------------------------")
         print(f"{'Grade':>6}  {'Count':>6}  {'Status'}")
-        print("─" * 44)
+        print("-" * 44)
         for grade in _ALL_GRADES:
             count = counts.get(grade, 0)
             if count >= _TARGET_THRESHOLD:
-                status = "✓ target met"
+                status = "[OK] target met"
             elif count < _WARNING_THRESHOLD:
-                status = "⚠ below warning"
+                status = "[!] below warning"
             else:
                 status = ""
             print(f"{grade:>6}  {count:>6}  {status}")
-        print("─" * 44)
+        print("-" * 44)
         print(f"{'TOTAL':>6}  {sum(counts.values()):>6}")
 
         if rejection_counts:
-            print("\n── Rejection Counts ────────────────────────")
+            print("\n-- Rejection Counts -------------------------------------")
             for filter_name, count in sorted(rejection_counts.items()):
                 print(f"  {filter_name:<30} {count:>6}")
         print()

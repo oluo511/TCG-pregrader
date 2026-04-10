@@ -104,10 +104,14 @@ class PipelineSettings(BaseSettings):
         description="Mean luminance ceiling; images above this are overexposed/glare",
     )
     max_skew_angle: float = Field(
-        default=5.0,
+        default=90.0,
         ge=0.0,
         le=90.0,
-        description="Max slab tilt in degrees before perspective correction is attempted",
+        description=(
+            "Max slab tilt in degrees before perspective correction is attempted. "
+            "Set to 90.0 (default) to disable angle rejection during data collection — "
+            "the skew detector is unreliable on small thumbnails."
+        ),
     )
 
     # -------------------------------------------------------------------------

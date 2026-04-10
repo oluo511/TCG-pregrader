@@ -23,14 +23,53 @@ Why catch broad Exception after ConfigurationError?
 
 import asyncio
 import sys
+import warnings
 from pathlib import Path
 from typing import Annotated
+
+# Suppress Windows asyncio/Playwright subprocess pipe cleanup noise.
+# These fire via sys.unraisablehook during interpreter shutdown when CPython's
+# GC collects Playwright's subprocess transport objects. They bypass the normal
+# warnings filter, so we patch the hook directly.
+_original_unraisablehook = sys.unraisablehook
+
+def _quiet_unraisablehook(unraisable):
+    if isinstance(unraisable.exc_value, ValueError) and "I/O operation on closed pipe" in str(unraisable.exc_value):
+        return
+    _original_unraisablehook(unraisable)
+
+sys.unraisablehook = _quiet_unraisablehook
 
 import typer
 
 from data_pipeline.config import PipelineSettings
 from data_pipeline.exceptions import ConfigurationError
 from data_pipeline.orchestrator import Orchestrator
+
+
+def _configure_logging() -> None:
+    """Minimal structlog setup for the pipeline CLI."""
+    import logging
+    import sys
+    import structlog
+
+    logging.basicConfig(format="%(message)s", stream=sys.stdout, level=logging.INFO)
+
+    # Silence noisy third-party loggers
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
+
+    structlog.configure(
+        processors=[
+            structlog.stdlib.add_log_level,
+            structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S"),
+            structlog.dev.ConsoleRenderer(),
+        ],
+        wrapper_class=structlog.stdlib.BoundLogger,
+        context_class=dict,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+    )
 
 app = typer.Typer(
     help="TCG training data pipeline — scrape, download, and filter PSA slab photos."
@@ -76,6 +115,8 @@ def run(
         typer.echo(f"Configuration error: {exc}", err=True)
         raise typer.Exit(code=1)
 
+    _configure_logging()
+
     # Override PipelineSettings paths when the operator provides CLI flags.
     # model_copy(update=…) returns a new immutable instance — we never mutate
     # the original settings object, which keeps the pattern safe for testing.
@@ -84,13 +125,20 @@ def run(
     if manifest_path is not None:
         settings = settings.model_copy(update={"manifest_path": manifest_path})
 
-    # Run the full pipeline synchronously from the CLI's perspective.
-    # Orchestrator.run() is async internally (concurrent scrapers, async HTTP),
-    # but the CLI is a one-shot process so asyncio.run() is the right bridge.
     report = asyncio.run(
         Orchestrator(settings).run(grades=grades, max_per_grade=max_per_grade)
     )
 
+    # Force GC before interpreter shutdown to avoid Windows asyncio pipe
+    # cleanup noise from Playwright's subprocess transport __del__ methods.
+    import gc
+    gc.collect()
+
     # GradeReporter already printed the grade distribution table to stdout
     # inside report(). We just confirm completion with the aggregate count.
     typer.echo(f"\nPipeline complete. Total images: {report.total_images}")
+
+if __name__ == "__main__":
+    import warnings
+    warnings.filterwarnings("ignore", category=ResourceWarning)
+    app()
