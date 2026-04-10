@@ -161,6 +161,7 @@ class TrainingLoop:
         train_ds: tf.data.Dataset,
         val_ds: tf.data.Dataset,
         config: TrainingConfig,
+        class_weight: dict[int, float] | None = None,
     ) -> Path:
         """Build, train, and save the model.
 
@@ -168,6 +169,8 @@ class TrainingLoop:
             train_ds: Unbatched training dataset of (image, label) pairs.
             val_ds: Unbatched validation dataset of (image, label) pairs.
             config: TrainingConfig with hyperparameters and output paths.
+            class_weight: Optional dict mapping 0-indexed grade to loss weight.
+                          Use compute_class_weights() for imbalanced datasets.
 
         Returns:
             Path to the saved TF SavedModel directory.
@@ -264,6 +267,7 @@ class TrainingLoop:
             validation_data=val_ds_final,
             epochs=config.epochs,
             callbacks=callbacks,
+            class_weight=class_weight,
             verbose=1,
         )
 
