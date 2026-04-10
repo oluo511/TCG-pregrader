@@ -86,6 +86,39 @@ class AugmentationPipeline:
         # Fraction of image height occupied by the PSA label region (bottom 15%)
         self._label_region_fraction = label_region_fraction
 
+    def apply_batch(self, images: tf.Tensor, training: bool = True) -> tf.Tensor:
+        """Apply augmentation to a batch of images (rank-4 tensor).
+
+        This is the preferred entry point for tf.data.map() — operating on
+        batches avoids the expand_dims/squeeze workaround needed for rank-3
+        single images, and RandomRotation handles rank-4 natively.
+
+        Args:
+            images: Float32 tensor of shape (B, H, W, 3), values in [0.0, 1.0].
+            training: When False, returns images unchanged.
+
+        Returns:
+            Augmented float32 tensor of shape (B, H, W, 3).
+        """
+        if not training:
+            return images
+
+        # Apply per-image ops that work on rank-4 batches natively
+        images = tf.image.random_flip_left_right(images)
+        images = tf.image.random_brightness(images, max_delta=_BRIGHTNESS_DELTA)
+        images = tf.clip_by_value(images, 0.0, 1.0)
+
+        # RandomRotation accepts rank-4 (B, H, W, C) natively
+        images = self._rotation_layer(images, training=True)
+        images = tf.clip_by_value(images, 0.0, 1.0)
+
+        # Apply slab-specific augmentations per image using vectorized_map
+        # to avoid the dynamic shape issues of map() on rank-3 tensors.
+        images = tf.vectorized_map(self._apply_glare, images)
+        images = tf.vectorized_map(self._apply_label_occlusion, images)
+
+        return images
+
     def apply(self, image_tensor: tf.Tensor, training: bool = True) -> tf.Tensor:
         """Apply random horizontal flip, brightness jitter, rotation, and slab transforms.
 
@@ -123,9 +156,9 @@ class AugmentationPipeline:
         image = tf.image.random_brightness(image, max_delta=_BRIGHTNESS_DELTA)
         image = tf.clip_by_value(image, 0.0, 1.0)
 
-        # Random rotation ±5° using tfa-free approach.
-        # We use tf.keras.layers.RandomRotation but it must be pre-instantiated
-        # (see __init__) to avoid creating tf.Variables inside tf.function traces.
+        # Random rotation ±5°.
+        # expand_dims/squeeze wraps the single image as a fake batch so
+        # RandomRotation receives rank-4 input as it expects.
         image = tf.expand_dims(image, axis=0)
         image = self._rotation_layer(image, training=True)
         image = tf.squeeze(image, axis=0)
@@ -145,70 +178,46 @@ class AugmentationPipeline:
 
         # (H, W, 3) — float32, values in [0.0, 1.0]
 
-        Why upper 85% only? The bottom 15% is the PSA label region. Glare on
-        the label would be redundant with label occlusion and could confuse the
-        model about label presence. Real-world glare from overhead lighting
-        predominantly hits the card surface, not the label (Req 12.1).
-
-        Why tf.cond instead of Python if? This method may be traced by
-        tf.function (e.g., inside tf.data.Dataset.map). Python if on a tensor
-        value is not graph-safe — tf.cond is the correct graph-mode branch.
-
-        Args:
-            image: Float32 tensor of shape (H, W, 3), values in [0.0, 1.0].
-
-        Returns:
-            Float32 tensor of shape (H, W, 3) with glare applied or unchanged.
+        Implementation note: uses static shape (_HEIGHT, _WIDTH) constants
+        rather than dynamic tf.shape() to avoid shape inference issues when
+        traced inside tf.data.map(). This means the augmentation is tied to
+        the fixed input dimensions — acceptable since the pipeline always
+        produces (312, 224, 3) images after preprocessing.
         """
-        # Probability gate — sample once per image
         apply_gate = tf.random.uniform([], 0.0, 1.0)
 
         def glare_fn() -> tf.Tensor:
-            # (H, W, 3) — read dynamic shape for graph-mode compatibility
-            H = tf.shape(image)[0]
-            W = tf.shape(image)[1]
+            # Use static dimensions to avoid dynamic shape issues in graph mode.
+            # These must match the actual image dimensions from the pipeline.
+            H_static = 312
+            W_static = 224
 
-            # Sample ellipse center — constrained to upper 85% to avoid label region
-            cx = tf.random.uniform([], 0, W, dtype=tf.int32)
-            cy = tf.random.uniform(
-                [],
-                0,
-                tf.cast(tf.cast(H, tf.float32) * 0.85, tf.int32),
-                dtype=tf.int32,
-            )
-
-            # Sample ellipse axes as fractions of image dimensions
-            rx = tf.random.uniform([], 0.05, 0.25) * tf.cast(W, tf.float32)
-            ry = tf.random.uniform([], 0.05, 0.25) * tf.cast(H, tf.float32)
-
-            # Sample glare intensity — moderate range avoids total washout
+            cx = tf.random.uniform([], 0, W_static, dtype=tf.int32)
+            cy = tf.random.uniform([], 0, int(H_static * 0.85), dtype=tf.int32)
+            rx = tf.random.uniform([], 0.05, 0.25) * float(W_static)
+            ry = tf.random.uniform([], 0.05, 0.25) * float(H_static)
             intensity = tf.random.uniform([], 0.3, 0.7)
 
-            # Build coordinate grids — (W,) and (H,) ranges cast to float
-            xs = tf.cast(tf.range(W), tf.float32)  # (W,)
-            ys = tf.cast(tf.range(H), tf.float32)  # (H,)
+            # Build coordinate grids with static shapes — no dynamic tile needed.
+            # X[i,j] = j (column), Y[i,j] = i (row)
+            col_idx = tf.cast(tf.range(W_static), tf.float32)          # (W,)
+            row_idx = tf.cast(tf.range(H_static), tf.float32)          # (H,)
 
-            # meshgrid produces X shape (H, W) and Y shape (H, W)
-            X, Y = tf.meshgrid(xs, ys)
+            # Static tile: shapes are known at trace time
+            X = tf.tile(tf.reshape(col_idx, [1, W_static]), [H_static, 1])  # (H, W)
+            Y = tf.tile(tf.reshape(row_idx, [H_static, 1]), [1, W_static])  # (H, W)
 
-            # Ellipse mask: 1.0 inside ellipse, 0.0 outside — shape (H, W)
             mask = tf.cast(
                 ((X - tf.cast(cx, tf.float32)) / rx) ** 2
                 + ((Y - tf.cast(cy, tf.float32)) / ry) ** 2
                 <= 1.0,
                 tf.float32,
-            )
+            )  # (H, W)
 
-            # Expand to (H, W, 1) for broadcast against (H, W, 3)
-            mask = tf.expand_dims(mask, axis=-1)
-
-            # Blend: inside ellipse → push toward white (1.0) by intensity
+            mask = tf.expand_dims(mask, axis=-1)  # (H, W, 1)
             blended = image * (1.0 - intensity * mask) + intensity * mask
-
-            # Clamp to valid pixel range
             return tf.clip_by_value(blended, 0.0, 1.0)
 
-        # Graph-safe conditional — only compute glare_fn() when gate passes
         return tf.cond(
             apply_gate < self._glare_probability,
             true_fn=glare_fn,
@@ -220,47 +229,35 @@ class AugmentationPipeline:
 
         # (H, W, 3) — float32, values in [0.0, 1.0]
 
-        Why mean-color fill instead of black or white? A solid black or white
-        fill is an obvious synthetic artifact that the model could learn to
-        detect. Mean-color fill is visually neutral and harder to distinguish
-        from a naturally obscured label region (Req 12.2).
-
-        Why tf.cond? Same graph-mode safety reason as _apply_glare — this
-        method may be traced inside tf.data.Dataset.map.
-
-        Args:
-            image: Float32 tensor of shape (H, W, 3), values in [0.0, 1.0].
-
-        Returns:
-            Float32 tensor of shape (H, W, 3) with label region occluded or unchanged.
+        Uses static width constant (224) to avoid dynamic shape issues in
+        tf.data.map() graph tracing — same constraint as _apply_glare.
         """
-        # Probability gate — sample once per image
         apply_gate = tf.random.uniform([], 0.0, 1.0)
 
         def occlusion_fn() -> tf.Tensor:
-            # (H, W, 3) — read dynamic height for graph-mode compatibility
             H = tf.shape(image)[0]
 
-            # Number of rows to replace at the bottom of the image
             label_rows = tf.cast(
                 tf.cast(H, tf.float32) * self._label_region_fraction, tf.int32
             )
             keep_rows = H - label_rows
 
-            # Compute mean color across all spatial positions — shape (3,)
-            # This gives a neutral fill that blends with the card's color palette
-            mean_color = tf.reduce_mean(image, axis=[0, 1])
+            mean_color = tf.reduce_mean(image, axis=[0, 1])  # (3,)
 
-            # Build fill block: (label_rows, W, 3) filled with mean_color
-            fill = (
-                tf.ones([label_rows, tf.shape(image)[1], 3], dtype=tf.float32)
-                * mean_color
-            )
+            # Build a mask: 1.0 for rows to keep, 0.0 for label region rows.
+            # This avoids concat with dynamic shapes entirely.
+            # keep_mask shape: (H, 1, 1) — broadcasts against (H, W, 3)
+            keep_mask = tf.cast(
+                tf.range(H) < keep_rows, tf.float32
+            )  # (H,)
+            keep_mask = tf.reshape(keep_mask, [H, 1, 1])  # (H, 1, 1)
 
-            # Splice: keep top rows unchanged, replace bottom rows with fill
-            return tf.concat([image[:keep_rows, :, :], fill], axis=0)
+            # Fill mask: 1.0 for label region rows, 0.0 for card body rows
+            fill_mask = 1.0 - keep_mask  # (H, 1, 1)
 
-        # Graph-safe conditional
+            # Blend: keep original pixels in card body, replace with mean in label
+            return image * keep_mask + mean_color * fill_mask
+
         return tf.cond(
             apply_gate < self._label_occlusion_probability,
             true_fn=occlusion_fn,

@@ -138,11 +138,12 @@ def _make_ordinal_targets(
     Returns:
         Float32 tensor of shape (batch, num_thresholds) with binary targets.
     """
-    # thresholds shape: (1, num_thresholds) — broadcast against labels (batch, 1)
-    thresholds = tf.cast(tf.range(num_thresholds), tf.int32)[tf.newaxis, :]
-    labels_expanded = tf.cast(labels, tf.int32)[:, tf.newaxis]
-    # t[i, k] = 1 if label[i] <= k, else 0
-    targets = tf.cast(labels_expanded <= thresholds, tf.float32)
+    # labels shape: (batch,) → expand to (batch, 1) for broadcasting
+    # thresholds shape: (1, num_thresholds)
+    # result: (batch, num_thresholds) via broadcast
+    thresholds = tf.cast(tf.range(num_thresholds), tf.int32)[tf.newaxis, :]  # (1, 9)
+    labels_2d = tf.cast(labels, tf.int32)[:, tf.newaxis]  # (batch, 1)
+    targets = tf.cast(labels_2d <= thresholds, tf.float32)  # (batch, 9)
     return targets
 
 
@@ -176,15 +177,10 @@ class TrainingLoop:
 
         augmentation = AugmentationPipeline()
 
-        # Apply augmentation only to training data, then batch and prefetch.
-        # Prefetch overlaps data loading with model execution — critical for
-        # GPU utilization. AUTOTUNE lets TF tune the buffer size dynamically.
+        # Batch first, then apply augmentation at batch level.
+        # This avoids the rank-3 → rank-4 expand_dims issues in map().
         train_ds_prepared = (
             train_ds
-            .map(
-                lambda img, lbl: (augmentation.apply(img), lbl),
-                num_parallel_calls=tf.data.AUTOTUNE,
-            )
             .batch(config.batch_size)
             .prefetch(tf.data.AUTOTUNE)
         )
@@ -239,6 +235,18 @@ class TrainingLoop:
         # The dataset yields (image, label) but the model expects
         # (image, {head: ordinal_targets}) — we need a wrapper dataset.
         def _add_ordinal_targets(image: tf.Tensor, label: tf.Tensor):
+            # Apply augmentation here — image is rank-4 (B, H, W, C) at this point
+            image = augmentation.apply_batch(image, training=True)
+            targets = _make_ordinal_targets(label)
+            return image, {
+                "overall": targets,
+                "centering": targets,
+                "corners": targets,
+                "edges": targets,
+                "surface": targets,
+            }
+
+        def _add_ordinal_targets_val(image: tf.Tensor, label: tf.Tensor):
             targets = _make_ordinal_targets(label)
             return image, {
                 "overall": targets,
@@ -249,7 +257,7 @@ class TrainingLoop:
             }
 
         train_ds_final = train_ds_prepared.map(_add_ordinal_targets)
-        val_ds_final = val_ds_prepared.map(_add_ordinal_targets)
+        val_ds_final = val_ds_prepared.map(_add_ordinal_targets_val)
 
         model.fit(
             train_ds_final,
