@@ -18,28 +18,25 @@ from typing import Any, Optional
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic_settings.sources import EnvSettingsSource
+from pydantic_settings.sources import DotEnvSettingsSource, EnvSettingsSource
 
 from pregrader.enums import CardType
 from pregrader.exceptions import ConfigurationError
 
 # Fields whose env values are comma-separated strings rather than JSON arrays.
-# pydantic-settings' EnvSettingsSource calls json.loads() on list fields before
-# validators run, which breaks "pokemon,one_piece" style values. We subclass
-# EnvSettingsSource to intercept those fields and convert them to JSON arrays
-# before the base class attempts to decode them.
+# pydantic-settings calls json.loads() inside prepare_field_value() *before*
+# Pydantic's own validators fire, so a mode="before" field_validator never sees
+# the raw string — the SettingsError is raised first. We must intercept at the
+# source level for BOTH the OS-env source AND the dotenv source.
 _CSV_LIST_FIELDS = {"enabled_card_types"}
 
 
-class _CsvAwareEnvSource(EnvSettingsSource):
-    """Custom env source that converts comma-separated strings to JSON arrays
-    for fields listed in _CSV_LIST_FIELDS.
+class _CsvNormMixin:
+    """Mixin that normalises comma-separated env values to JSON arrays.
 
-    Why subclass instead of a field_validator?
-    pydantic-settings calls json.loads() inside prepare_field_value() *before*
-    Pydantic's own validators fire. A mode="before" field_validator never sees
-    the raw string — the SettingsError is raised first. Subclassing lets us
-    normalise the value at the source level, before any JSON parsing occurs.
+    Applied to both EnvSettingsSource (OS env vars) and DotEnvSettingsSource
+    (.env file) so that ENABLED_CARD_TYPES=pokemon,one_piece works in either
+    context without requiring JSON array syntax.
     """
 
     def prepare_field_value(
@@ -49,6 +46,8 @@ class _CsvAwareEnvSource(EnvSettingsSource):
         value: Any,
         value_is_complex: bool,
     ) -> Any:
+        import json
+
         # Convert "pokemon,one_piece" → '["pokemon","one_piece"]' so the base
         # class json.loads() call succeeds and Pydantic coerces each element.
         if (
@@ -56,11 +55,17 @@ class _CsvAwareEnvSource(EnvSettingsSource):
             and isinstance(value, str)
             and not value.strip().startswith("[")
         ):
-            import json
-
             items = [item.strip() for item in value.split(",") if item.strip()]
             value = json.dumps(items)
-        return super().prepare_field_value(field_name, field, value, value_is_complex)
+        return super().prepare_field_value(field_name, field, value, value_is_complex)  # type: ignore[misc]
+
+
+class _CsvAwareEnvSource(_CsvNormMixin, EnvSettingsSource):
+    """OS environment variable source with CSV normalisation."""
+
+
+class _CsvAwareDotEnvSource(_CsvNormMixin, DotEnvSettingsSource):
+    """.env file source with CSV normalisation."""
 
 
 class PregraderSettings(BaseSettings):
@@ -82,12 +87,41 @@ class PregraderSettings(BaseSettings):
 
     @classmethod
     def settings_customise_sources(cls, settings_cls: type, **kwargs: Any) -> tuple:  # type: ignore[override]
-        """Replace the default EnvSettingsSource with our CSV-aware subclass."""
+        """Replace both env sources with CSV-aware subclasses.
+
+        Why replace dotenv_settings too?
+        DotEnvSettingsSource is a separate class from EnvSettingsSource.
+        Both call prepare_field_value() independently, so the CSV mixin must
+        be applied to both or .env file values still hit json.loads() raw.
+
+        Why forward kwargs to _CsvAwareDotEnvSource instead of constructing
+        it fresh?
+        pydantic-settings passes a pre-configured DotEnvSettingsSource via
+        kwargs["dotenv_settings"] that already reflects any _env_file=None
+        override passed at instantiation time. Constructing a new instance
+        from settings_cls alone would always read model_config's env_file,
+        ignoring runtime overrides. We instead subclass on-the-fly using the
+        same init args so the override is preserved.
+        """
         init_settings = kwargs.get("init_settings")
         env_settings = _CsvAwareEnvSource(settings_cls)
-        dotenv_settings = kwargs.get("dotenv_settings")
+
+        # Preserve the dotenv source only if pydantic-settings provided one.
+        # When _env_file=None is passed at instantiation, pydantic-settings
+        # sets dotenv_settings=None — we must honour that to allow tests to
+        # suppress .env loading for env-isolation scenarios.
+        raw_dotenv = kwargs.get("dotenv_settings")
+        if raw_dotenv is not None:
+            # Re-wrap with our mixin so CSV normalisation applies to .env values.
+            dotenv_settings = _CsvAwareDotEnvSource(
+                settings_cls,
+                env_file=raw_dotenv.env_file,
+                env_file_encoding=raw_dotenv.env_file_encoding,
+            )
+        else:
+            dotenv_settings = None
+
         secrets_settings = kwargs.get("secrets_settings")
-        # Return only non-None sources to avoid TypeError from None entries.
         sources = [s for s in [init_settings, env_settings, dotenv_settings, secrets_settings] if s is not None]
         return tuple(sources)
 

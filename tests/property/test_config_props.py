@@ -143,7 +143,13 @@ def test_valid_config_instantiates_successfully(config: dict[str, Any]) -> None:
 
 
 def _assert_invalid_env(env: dict[str, str]) -> None:
-    """Inject env vars, attempt to construct PregraderSettings, assert ValidationError."""
+    """Inject env vars, attempt to construct PregraderSettings, assert ValidationError.
+
+    We pass _env_file=None to suppress .env file loading so the test controls
+    the full configuration surface via os.environ only. Without this, a valid
+    .env on disk would mask missing required fields and the ValidationError
+    would never fire.
+    """
     import sys
 
     # Isolate env manipulation — restore original env after the assertion.
@@ -159,7 +165,9 @@ def _assert_invalid_env(env: dict[str, str]) -> None:
         from pregrader.config import PregraderSettings
 
         with pytest.raises(ValidationError):
-            PregraderSettings()
+            # _env_file=None disables .env file loading so only os.environ is
+            # consulted — gives the test full control over the config surface.
+            PregraderSettings(_env_file=None)
     finally:
         _restore_env(original)
 
@@ -175,7 +183,8 @@ def _assert_valid_env(env: dict[str, str]) -> None:
 
         from pregrader.config import PregraderSettings
 
-        instance = PregraderSettings()
+        # _env_file=None: same isolation rationale as _assert_invalid_env.
+        instance = PregraderSettings(_env_file=None)
         # Spot-check that the instance actually holds the injected values.
         assert instance.api_port == int(env["API_PORT"])
         assert instance.log_level == env["LOG_LEVEL"].upper()

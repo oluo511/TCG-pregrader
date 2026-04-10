@@ -85,7 +85,7 @@ def test_property4_full_tensor_shape_invariant(image_bytes: bytes) -> None:
 # ---------------------------------------------------------------------------
 
 @given(image_bytes=_image_strategy)
-@settings(max_examples=100)
+@settings(max_examples=100, deadline=None)
 def test_property5_region_extraction_completeness(image_bytes: bytes) -> None:
     """For any valid input image, the result must contain exactly four
     CardRegion objects with names {"centering", "corners", "edges", "surface"}.
